@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"slices"
 	"sync"
+	"time"
 
 	"filippo.io/age"
 	"filippo.io/age/plugin"
@@ -92,7 +94,7 @@ func ParseIdentityOptions(data []byte) (IdentityOptions, error) {
 	if err := dec.Decode(&o); err != nil {
 		return o, fmt.Errorf("malformed awskms identity: %w", err)
 	}
-	if dec.More() {
+	if dec.Decode(new(json.RawMessage)) != io.EOF {
 		return o, errors.New("malformed awskms identity: trailing data")
 	}
 	return o, o.validate()
@@ -125,10 +127,27 @@ func NewIdentity(opts IdentityOptions, clients *Clients) (*Identity, error) {
 	return &Identity{opts: opts, clients: clients}, nil
 }
 
+// maxDecryptCalls bounds the kms:Decrypt calls a single file can trigger, and
+// unwrapTimeout the total time spent on it. A crafted header can carry many
+// stanzas; age only authenticates the header after a file key is found.
+const (
+	maxDecryptCalls = 8
+	unwrapTimeout   = 2 * time.Minute
+)
+
 // Unwrap implements age.Identity.
+//
+// A key this identity may not use (disallowed account, AWS error such as
+// AccessDeniedException) is not a match: the reason is reported through Warn
+// and age.ErrIncorrectIdentity is returned, so age can try other identities.
+// Malformed stanzas and inconsistent KMS responses are fatal.
 func (i *Identity) Unwrap(stanzas []*age.Stanza) ([]byte, error) {
-	ctx := context.Background()
-	var lastErr error
+	type candidate struct {
+		arn KeyARN
+		s   *age.Stanza
+	}
+	// Validate every stanza before calling AWS, and drop duplicates.
+	var candidates []candidate
 	for _, s := range stanzas {
 		if s.Type != StanzaType {
 			continue
@@ -140,26 +159,53 @@ func (i *Identity) Unwrap(stanzas []*age.Stanza) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("malformed awskms stanza: %w", err)
 		}
-		ok, err := i.allowed(ctx, arn)
+		if !validWrappedKeyLength(len(s.Body)) {
+			return nil, errors.New("malformed awskms stanza: unexpected wrapped key length")
+		}
+		if !slices.ContainsFunc(candidates, func(c candidate) bool {
+			return c.arn == arn && bytes.Equal(c.s.Body, s.Body)
+		}) {
+			candidates = append(candidates, candidate{arn, s})
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, age.ErrIncorrectIdentity
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), unwrapTimeout)
+	defer cancel()
+	calls := 0
+	for _, c := range candidates {
+		ok, err := i.allowed(ctx, c.arn)
 		if err != nil {
-			return nil, err
+			i.warn(fmt.Sprintf("skipping %s: %v", c.arn, err))
+			return nil, age.ErrIncorrectIdentity
 		}
 		if !ok {
-			if i.Warn != nil {
-				i.Warn(fmt.Sprintf("skipping %s: account %s is not allowed by this identity", arn, arn.Account))
-			}
+			i.warn(fmt.Sprintf("skipping %s: account %s is not allowed by this identity", c.arn, c.arn.Account))
 			continue
 		}
-		fileKey, err := decryptStanza(ctx, i.clients, arn, s)
-		if err == nil {
-			return fileKey, nil
+		if calls == maxDecryptCalls {
+			i.warn(fmt.Sprintf("skipping remaining awskms stanzas: at most %d kms:Decrypt calls per file", maxDecryptCalls))
+			break
 		}
-		lastErr = fmt.Errorf("%s: %w", arn, err)
-	}
-	if lastErr != nil {
-		return nil, lastErr
+		calls++
+		fileKey, err := decryptStanza(ctx, i.clients, c.arn, c.s)
+		switch {
+		case err == nil:
+			return fileKey, nil
+		case errors.Is(err, errUnexpectedResponse):
+			return nil, fmt.Errorf("%s: %w", c.arn, err)
+		}
+		i.warn(fmt.Sprintf("%s: %v", c.arn, err))
 	}
 	return nil, age.ErrIncorrectIdentity
+}
+
+func (i *Identity) warn(msg string) {
+	if i.Warn != nil {
+		i.Warn(msg)
+	}
 }
 
 func (i *Identity) allowed(ctx context.Context, arn KeyARN) (bool, error) {
@@ -169,20 +215,23 @@ func (i *Identity) allowed(ctx context.Context, arn KeyARN) (bool, error) {
 	case len(i.opts.Accounts) > 0:
 		return slices.Contains(i.opts.Accounts, arn.Account), nil
 	}
-	caller, err := i.callerAccount(ctx, arn.Region)
+	caller, err := i.callerAccount(ctx)
 	if err != nil {
 		return false, err
 	}
 	return caller == arn.Account, nil
 }
 
-func (i *Identity) callerAccount(ctx context.Context, region string) (string, error) {
+// callerAccount resolves the account of the current credentials. The STS
+// region comes from the AWS configuration, never from the file being
+// decrypted.
+func (i *Identity) callerAccount(ctx context.Context) (string, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.caller != "" {
 		return i.caller, nil
 	}
-	client, err := i.clients.STS(ctx, region)
+	client, err := i.clients.STS(ctx)
 	if err != nil {
 		return "", err
 	}

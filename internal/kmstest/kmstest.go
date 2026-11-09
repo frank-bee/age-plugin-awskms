@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 
@@ -88,6 +89,13 @@ func (f *KMS) lookup(id string) *Key {
 
 func apiError(code string) error {
 	return &smithy.GenericAPIError{Code: code, Message: code}
+}
+
+// Keys returns the registered keys.
+func (f *KMS) Keys() []*Key {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.keys)
 }
 
 // DecryptCalls returns and resets the number of kms:Decrypt calls.
