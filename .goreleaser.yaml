@@ -1,0 +1,52 @@
+version: 2
+
+project_name: age-plugin-awskms
+
+builds:
+  - main: .
+    binary: age-plugin-awskms
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version=v{{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: SHA256SUMS
+
+changelog:
+  disable: true
+
+release:
+  # release-please creates the GitHub release and its notes; only add assets.
+  mode: keep-existing
+
+homebrew_casks:
+  - name: age-plugin-awskms
+    repository:
+      owner: frank-bee
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    # Without the tap token the GitHub release still succeeds.
+    skip_upload: '{{ if eq .Env.HOMEBREW_TAP_GITHUB_TOKEN "" }}true{{ end }}'
+    homepage: https://github.com/frank-bee/age-plugin-awskms
+    description: age plugin for asymmetric RSA keys in AWS KMS
+    license: BSD-3-Clause
+    dependencies:
+      - formula: age
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/age-plugin-awskms"]
+          end
