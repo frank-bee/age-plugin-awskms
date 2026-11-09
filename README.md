@@ -22,7 +22,9 @@ age -d -j awskms -o backup.tar backup.tar.age          # calls kms:Decrypt
 
 ## Install
 
-You need [age](https://github.com/FiloSottile/age) v1.1.0 or later and the
+You need [age](https://github.com/FiloSottile/age) v1.2.1 or later (older
+versions are affected by a [plugin name vulnerability](https://github.com/FiloSottile/age/security/advisories/GHSA-32gq-x56h-299c);
+v1.3.2 is tested) and the
 `age-plugin-awskms` binary in your `PATH`.
 
 **Homebrew (macOS)**
@@ -30,6 +32,11 @@ You need [age](https://github.com/FiloSottile/age) v1.1.0 or later and the
 ```sh
 brew install frank-bee/tap/age-plugin-awskms
 ```
+
+The binaries are not yet signed or notarized by Apple. So that macOS runs the
+plugin when age starts it, the cask removes the quarantine attribute after
+installing. Homebrew verifies the download against the checksum in the tap
+first. If you prefer to keep Gatekeeper in the loop, install with Go instead.
 
 **Pre-built binaries** for macOS, Linux and Windows (amd64, arm64) are on the
 [releases page](https://github.com/frank-bee/age-plugin-awskms/releases).
@@ -95,7 +102,8 @@ age -d -j awskms -o secrets.tar secrets.tar.age
 the file itself, so decryption keeps working after you move an alias to a new
 key.
 
-Credentials come from the standard AWS SDK chain: environment variables,
+The region comes from the key ARN in the file. Credentials come from the
+standard AWS SDK chain: environment variables,
 `AWS_PROFILE`, SSO, web identity (EKS IRSA, GitHub Actions OIDC), container
 and instance roles.
 
@@ -120,8 +128,16 @@ age -d -i awskms.txt -o secrets.tar secrets.tar.age
 `-allow-any-account` disables the check. Skipped keys are reported, so you can
 tell why no identity matched.
 
+The current account is looked up with `sts:GetCallerIdentity` in your
+configured region, or `us-east-1` if none is set; in the China and GovCloud
+partitions, set `AWS_REGION`. A key this identity may not use (disallowed
+account, access denied, disabled key) does not stop age: the reason is shown
+and the next identity is tried. One file triggers at most 8 `kms:Decrypt`
+calls and gives up after 2 minutes.
+
 Identity files contain **no secret**, only these options, and can be shared or
-committed. Access is always decided by IAM and the key policy.
+committed. Access is always decided by IAM and the key policy. The `-key`
+option only selects the key for encryption; it does not restrict decryption.
 
 ## Encrypting without a recipient string
 
@@ -151,12 +167,21 @@ Decrypting:
 {
   "Effect": "Allow",
   "Action": "kms:Decrypt",
-  "Resource": "arn:aws:kms:us-west-2:111122223333:key/*",
+  "Resource": [
+    "arn:aws:kms:us-west-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+    "arn:aws:kms:us-west-2:111122223333:key/0987dcba-09fe-87dc-65ba-ab0987654321"
+  ],
   "Condition": {
     "StringEquals": { "kms:EncryptionAlgorithm": "RSAES_OAEP_SHA_256" }
   }
 }
 ```
+
+List every key whose files must stay readable, including old keys kept after
+rotation. Avoid `key/*`: the plugin restricts accounts, not keys, so a wildcard
+would let a crafted file make you decrypt with any RSA key the principal can
+use. For a key in another account, its key policy must also allow your
+principal.
 
 Creating recipients needs `kms:GetPublicKey` (and `kms:Decrypt` unless you use
 `-no-verify`). Encrypting with a recipient string needs nothing.
@@ -170,8 +195,14 @@ explicitly. Otherwise `AWS_PROFILE` applies.
 KMS cannot rotate asymmetric keys automatically. To rotate, create a new key,
 move the alias and publish a new recipient. Files always record the key ARN
 they were encrypted to, so **keep old keys enabled** as long as files
-encrypted to them must remain readable. Scheduling a key for deletion makes
-every file encrypted only to that key permanently undecryptable.
+encrypted to them must remain readable. A key that is disabled or pending
+deletion cannot decrypt; during the waiting period you can still cancel the
+deletion and re-enable the key. Once the key is deleted, every file encrypted
+only to that key is permanently undecryptable.
+
+Multi-Region keys (`mrk-...`) work, but decryption always calls the region
+recorded in the file; there is no automatic failover to a replica. If you need
+regional recovery, add a second recipient for the replica's ARN.
 
 ## How it works
 
@@ -204,9 +235,14 @@ locally.
   files today and later breaks RSA could recover their contents.
 - **Who can decrypt** is exactly who can call `kms:Decrypt` on the key: review
   the key policy and IAM, including administrators.
-- Decrypted data is written by age to wherever you send it. If decryption
-  fails midway, age reports an error, but output already written is not
-  authenticated; do not use it.
+- **Distribute recipients over a trusted channel.** A recipient is public but
+  not self-authenticating: someone who swaps it for their own RSA key (keeping
+  your ARN) receives your data, and offline encryption cannot notice. The
+  same applies to identity files, which choose the profile and allowed
+  accounts. Where you have AWS access, regenerate a recipient with
+  `age-plugin-awskms -recipient -key ARN` and compare; protect distributed copies.
+- age authenticates each chunk before writing it, but if decryption fails
+  midway the output is incomplete. Use it only after age exits successfully.
 
 ## Use as a Go library
 
