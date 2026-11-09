@@ -33,10 +33,22 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
+      # A GitHub App token scoped to the tap pushes the cask. GITHUB_TOKEN cannot
+      # write to another repository, and a PAT would carry the whole account.
+      # Without the app secret the release still succeeds, only without Homebrew.
+      - uses: actions/create-github-app-token@v2
+        id: tap-token
+        if: env.TAP_APP_PRIVATE_KEY != ''
+        env:
+          TAP_APP_PRIVATE_KEY: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+        with:
+          app-id: ${{ vars.TAP_APP_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          repositories: homebrew-tap
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ steps.tap-token.outputs.token }}
