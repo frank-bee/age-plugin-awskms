@@ -1,0 +1,2 @@
+# The test vector and key must stay byte-exact on every platform.
+awskms/testdata/** -text
