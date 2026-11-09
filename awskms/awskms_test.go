@@ -87,7 +87,7 @@ func TestRecipientEncoding(t *testing.T) {
 	}
 	for _, bad := range []string{
 		"age1yubikey1qwqsl9w8m9n5zzg4pl6n9l2m7c9zvl3r6dna7nsyqvh9nykgq0jjzklc6h",
-		s[:len(s)-1] + "q",
+		s[:len(s)-1] + flipped(s[len(s)-1]),
 		"age1awskms1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
 	} {
 		if _, err := awskms.ParseRecipient(bad); err == nil {
@@ -396,4 +396,13 @@ func TestIdentityOptionsTrailingData(t *testing.T) {
 	if _, err := awskms.ParseIdentityOptions([]byte(`{"accounts":["111122223333"]}` + "\n")); err != nil {
 		t.Error(err)
 	}
+}
+
+// flipped returns a Bech32 character different from c, so changing the
+// checksum always invalidates it.
+func flipped(c byte) string {
+	if c == 'q' {
+		return "p"
+	}
+	return "q"
 }
