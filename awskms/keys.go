@@ -73,10 +73,18 @@ func Verify(ctx context.Context, c *Clients, r *Recipient) error {
 	return nil
 }
 
+// errUnexpectedResponse marks a kms:Decrypt answer that does not belong to
+// the request. It is never treated as a mere non-match.
+var errUnexpectedResponse = errors.New("unexpected kms:Decrypt response")
+
+// validWrappedKeyLength reports whether n is the ciphertext size of a
+// supported key: RSA-2048, RSA-3072 or RSA-4096.
+func validWrappedKeyLength(n int) bool {
+	return n == 256 || n == 384 || n == 512
+}
+
 func decryptStanza(ctx context.Context, c *Clients, arn KeyARN, s *age.Stanza) ([]byte, error) {
-	switch len(s.Body) {
-	case 256, 384, 512: // RSA-2048, RSA-3072, RSA-4096
-	default:
+	if !validWrappedKeyLength(len(s.Body)) {
 		return nil, errors.New("malformed awskms stanza: unexpected wrapped key length")
 	}
 	client, err := c.KMS(ctx, arn.Region)
@@ -96,7 +104,7 @@ func decryptStanza(ctx context.Context, c *Clients, arn KeyARN, s *age.Stanza) (
 	if aws.ToString(out.KeyId) != arn.String() ||
 		out.EncryptionAlgorithm != types.EncryptionAlgorithmSpecRsaesOaepSha256 ||
 		len(out.Plaintext) != 16 {
-		return nil, errors.New("unexpected kms:Decrypt response")
+		return nil, errUnexpectedResponse
 	}
 	return out.Plaintext, nil
 }

@@ -18,7 +18,7 @@ import (
 func clientsFor(f *kmstest.KMS) *awskms.Clients {
 	return &awskms.Clients{
 		NewKMS: func(string) (awskms.KMSAPI, error) { return f, nil },
-		NewSTS: func(string) (awskms.STSAPI, error) { return f, nil },
+		NewSTS: func() (awskms.STSAPI, error) { return f, nil },
 	}
 }
 
@@ -210,11 +210,16 @@ func TestErrors(t *testing.T) {
 	r, _ := awskms.FetchRecipient(context.Background(), c, k.ARN)
 	archive := encrypt(t, []byte("x"), r)
 	id, _ := awskms.NewIdentity(awskms.IdentityOptions{}, c)
+	var warnings []string
+	id.Warn = func(m string) { warnings = append(warnings, m) }
 
+	// Access denied is not a match: age may try other identities, and the
+	// reason is reported as a warning.
 	f.SetDenied(k, true)
 	_, err := decrypt(archive, id)
-	if err == nil || !strings.Contains(err.Error(), "AccessDeniedException") {
-		t.Fatalf("denied: %v", err)
+	var noMatch *age.NoIdentityMatchError
+	if !errors.As(err, &noMatch) || len(warnings) != 1 || !strings.Contains(warnings[0], "AccessDeniedException") {
+		t.Fatalf("denied: %v, warnings %q", err, warnings)
 	}
 	f.SetDenied(k, false)
 
@@ -227,7 +232,6 @@ func TestErrors(t *testing.T) {
 	// Files without awskms stanzas are not ours.
 	x, _ := age.GenerateX25519Identity()
 	other := encrypt(t, []byte("x"), x.Recipient())
-	var noMatch *age.NoIdentityMatchError
 	if _, err := decrypt(other, id); !errors.As(err, &noMatch) {
 		t.Fatalf("foreign file: %v", err)
 	}
@@ -319,5 +323,77 @@ func TestIdentityAsRecipient(t *testing.T) {
 	t.Setenv(awskms.KeyEnv, "alias/other")
 	if _, err := withKey.Recipient(ctx); err != nil {
 		t.Fatal("identity key should take precedence over the environment:", err)
+	}
+}
+
+func TestFallbackToNextIdentity(t *testing.T) {
+	f := kmstest.New()
+	k := f.AddKey(2048, "")
+	r, _ := awskms.FetchRecipient(context.Background(), clientsFor(f), k.ARN)
+	archive := encrypt(t, []byte("fallback"), r)
+
+	// The first identity's credentials may not use the key; the second may.
+	deniedKMS := kmstest.New()
+	deniedKMS.AddExistingKey(k.Private, k.ARN, "")
+	deniedKMS.SetDenied(deniedKMS.Keys()[0], true)
+	first, _ := awskms.NewIdentity(awskms.IdentityOptions{}, clientsFor(deniedKMS))
+	second, _ := awskms.NewIdentity(awskms.IdentityOptions{}, clientsFor(f))
+	if got, err := decrypt(archive, first, second); err != nil || string(got) != "fallback" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
+
+func TestDecryptCallBudget(t *testing.T) {
+	f := kmstest.New()
+	k := f.AddKey(2048, "")
+	r, _ := awskms.FetchRecipient(context.Background(), clientsFor(f), k.ARN)
+	stanzas, err := r.Wrap(make([]byte, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.SetDenied(k, true)
+	id, _ := awskms.NewIdentity(awskms.IdentityOptions{}, clientsFor(f))
+
+	// Identical stanzas are tried once.
+	dup := []*age.Stanza{stanzas[0], stanzas[0], stanzas[0]}
+	if _, err := id.Unwrap(dup); !errors.Is(err, age.ErrIncorrectIdentity) {
+		t.Fatal(err)
+	}
+	if n := f.DecryptCalls(); n != 1 {
+		t.Fatalf("duplicates: %d kms:Decrypt calls", n)
+	}
+
+	// Many distinct stanzas are capped.
+	var many []*age.Stanza
+	for range 50 {
+		s, _ := r.Wrap(make([]byte, 16))
+		many = append(many, s[0])
+	}
+	if _, err := id.Unwrap(many); !errors.Is(err, age.ErrIncorrectIdentity) {
+		t.Fatal(err)
+	}
+	if n := f.DecryptCalls(); n > 8 {
+		t.Fatalf("%d kms:Decrypt calls for one file", n)
+	}
+
+	// A malformed stanza anywhere fails before any AWS call.
+	bad := append([]*age.Stanza{}, many[:3]...)
+	bad = append(bad, &age.Stanza{Type: awskms.StanzaType, Args: []string{k.ARN}, Body: make([]byte, 100)})
+	if _, err := id.Unwrap(bad); err == nil || errors.Is(err, age.ErrIncorrectIdentity) {
+		t.Fatalf("malformed: %v", err)
+	}
+	if n := f.DecryptCalls(); n != 0 {
+		t.Fatalf("malformed: %d kms:Decrypt calls", n)
+	}
+}
+
+func TestIdentityOptionsTrailingData(t *testing.T) {
+	for _, data := range []string{`{}]`, `{}}`, `{} {}`, `{}x`} {
+		if _, err := awskms.ParseIdentityOptions([]byte(data)); err == nil {
+			t.Errorf("%q accepted", data)
+		}
+	}
+	if _, err := awskms.ParseIdentityOptions([]byte(`{"accounts":["111122223333"]}` + "\n")); err != nil {
+		t.Error(err)
 	}
 }

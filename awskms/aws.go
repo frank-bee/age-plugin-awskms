@@ -35,18 +35,29 @@ type Clients struct {
 
 	// NewKMS and NewSTS override client construction, for tests.
 	NewKMS func(region string) (KMSAPI, error)
-	NewSTS func(region string) (STSAPI, error)
+	NewSTS func() (STSAPI, error)
 
 	once sync.Once
 	cfg  aws.Config
 	err  error
 }
 
-func (c *Clients) config(ctx context.Context) (aws.Config, error) {
+// defaultSTSRegion is used for sts:GetCallerIdentity and for the credential
+// providers when no region is configured. Users of other partitions (China,
+// GovCloud) must configure a region.
+const defaultSTSRegion = "us-east-1"
+
+// config loads the SDK configuration once. regionHint becomes the default
+// region when none is configured, so credential providers that call STS
+// themselves (assume role, web identity) have one too.
+func (c *Clients) config(ctx context.Context, regionHint string) (aws.Config, error) {
 	c.once.Do(func() {
 		var opts []func(*config.LoadOptions) error
 		if c.Profile != "" {
 			opts = append(opts, config.WithSharedConfigProfile(c.Profile))
+		}
+		if regionHint != "" {
+			opts = append(opts, config.WithDefaultRegion(regionHint))
 		}
 		c.cfg, c.err = config.LoadDefaultConfig(ctx, opts...)
 		if c.err != nil {
@@ -62,7 +73,7 @@ func (c *Clients) KMS(ctx context.Context, region string) (KMSAPI, error) {
 	if c.NewKMS != nil {
 		return c.NewKMS(region)
 	}
-	cfg, err := c.config(ctx)
+	cfg, err := c.config(ctx, region)
 	if err != nil {
 		return nil, err
 	}
@@ -76,19 +87,18 @@ func (c *Clients) KMS(ctx context.Context, region string) (KMSAPI, error) {
 	}), nil
 }
 
-// STS returns an STS client. fallbackRegion is used when no default region is
-// configured, so the caller's account can be resolved without extra setup.
-func (c *Clients) STS(ctx context.Context, fallbackRegion string) (STSAPI, error) {
+// STS returns an STS client for the configured region, or defaultSTSRegion.
+func (c *Clients) STS(ctx context.Context) (STSAPI, error) {
 	if c.NewSTS != nil {
-		return c.NewSTS(fallbackRegion)
+		return c.NewSTS()
 	}
-	cfg, err := c.config(ctx)
+	cfg, err := c.config(ctx, defaultSTSRegion)
 	if err != nil {
 		return nil, err
 	}
 	return sts.NewFromConfig(cfg, func(o *sts.Options) {
 		if o.Region == "" {
-			o.Region = fallbackRegion
+			o.Region = defaultSTSRegion
 		}
 	}), nil
 }
